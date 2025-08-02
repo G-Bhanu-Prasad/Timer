@@ -4,127 +4,133 @@
 #include "I2SOutput.h"
 #include "PlaylistSampleSource.h"
 
+// I²S pin configuration
 i2s_pin_config_t i2sPins = {
-    .bck_io_num = GPIO_NUM_27,
-    .ws_io_num = GPIO_NUM_14,
-    .data_out_num = GPIO_NUM_26,
-    .data_in_num = -1};
+  .bck_io_num   = GPIO_NUM_27,
+  .ws_io_num    = GPIO_NUM_14,
+  .data_out_num = GPIO_NUM_26,
+  .data_in_num  = -1
+};
 
-I2SOutput *output = nullptr;
-PlaylistSampleSource *playlist = nullptr;
+I2SOutput*             audio    = nullptr;
+PlaylistSampleSource*  playlist = nullptr;
 
-bool countingDown = false;
-int countdownFrom = -1;
-unsigned long lastPlayTime = 0;
-int currentNumber = -1;
+// Hold WAV filenames as Strings (so buffers are owned)…
+std::vector<String>    fileNames;
+// …then once built, grab their c_str() pointers here:
+std::vector<const char*> filePtrs;
 
-std::vector<const char *> getNumberAudioFiles(int number) {
-  std::vector<const char *> files;
+// Build and validate the full countdown list from 'start' down to 0
+void buildCountdownList(int start) {
+  fileNames.clear();
+  // Rough upper bound: each number might produce up to 2 files
+  fileNames.reserve((start + 1) * 2);
 
-  if (number == 0) {
-    files.push_back("/0.wav");
-    return files;
-  }
-
-  int hundreds = number / 100;
-  int remainder = number % 100;
-
-  if (hundreds > 0) {
-    char *hundred_digit = (char *)malloc(12);
-    snprintf(hundred_digit, 12, "/%d.wav", hundreds);
-    files.push_back(hundred_digit);
-    files.push_back(strdup("/100.wav"));
-  }
-
-  if (remainder > 0) {
-    if (remainder <= 20 || remainder % 10 == 0) {
-      char *path = (char *)malloc(12);
-      snprintf(path, 12, "/%d.wav", remainder);
-      files.push_back(path);
+  auto tryEnqueue = [&](const String& path) {
+    if (SPIFFS.exists(path)) {
+      fileNames.push_back(path);
     } else {
-      int tens = (remainder / 10) * 10;
-      int units = remainder % 10;
+      Serial.printf("Missing file: %s\n", path.c_str());
+    }
+  };
 
-      char *tens_path = (char *)malloc(12);
-      snprintf(tens_path, 12, "/%d.wav", tens);
-      files.push_back(tens_path);
+  for (int n = start; n >= 0; --n) {
+    if (n == 0) {
+      tryEnqueue("/0.wav");
+    } else {
+      int hundreds  = n / 100;
+      int remainder = n % 100;
 
-      char *units_path = (char *)malloc(12);
-      snprintf(units_path, 12, "/%d.wav", units);
-      files.push_back(units_path);
+      if (hundreds > 0) {
+        tryEnqueue("/" + String(hundreds) + ".wav");
+        tryEnqueue("/100.wav");
+      }
+
+      if (remainder > 0) {
+        if (remainder <= 20 || remainder % 10 == 0) {
+          tryEnqueue("/" + String(remainder) + ".wav");
+        } else {
+          int tens  = (remainder / 10) * 10;
+          int units = remainder % 10;
+          tryEnqueue("/" + String(tens) + ".wav");
+          tryEnqueue("/" + String(units) + ".wav");
+        }
+      }
     }
   }
 
-  return files;
+  // Now snapshot pointers (after all Strings are in place)
+  filePtrs.clear();
+  filePtrs.reserve(fileNames.size());
+  for (auto& s : fileNames) {
+    filePtrs.push_back(s.c_str());
+  }
+
+  Serial.printf("Built playlist: %u files, heap=%u\n",
+                (unsigned)filePtrs.size(), ESP.getFreeHeap());
 }
 
-void playNumber(int number) {
-  std::vector<const char *> files = getNumberAudioFiles(number);
-
-  for (auto &file : files) {
-    Serial.print("Queued: ");
-    Serial.println(file);
+void startFullCountdown(int start) {
+  // 1) Clean up any previous run
+  if (audio) {
+    audio->stop();
+    delete audio;
+    audio = nullptr;
   }
-
-  // Stop and delete previous output and playlist
-  if (output) {
-    output->stop();     // <--- Important: stop I2S and kill task
-    delete output;
-    output = nullptr;
-  }
-
   if (playlist) {
     delete playlist;
     playlist = nullptr;
   }
 
-  // Create new playlist and output
-  playlist = new PlaylistSampleSource(files);
-  output = new I2SOutput();
-  output->start(I2S_NUM_1, i2sPins, playlist);
-
-  
-}
-
-
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS Mount Failed");
+  // 2) Build the playlist
+  buildCountdownList(start);
+  if (filePtrs.empty()) {
+    Serial.println("⛔ No valid WAV files found—cannot start countdown.");
     return;
   }
 
-  Serial.println("SPIFFS Ready");
-  Serial.println("Enter a number (0–999) to start countdown:");
+  // 3) Create & start
+  playlist = new PlaylistSampleSource(filePtrs);
+  audio    = new I2SOutput();
+  audio->start(I2S_NUM_1, i2sPins, playlist);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed—halting.");
+    while (true) delay(1000);
+  }
+  Serial.println("SPIFFS Ready. Enter 0–999 to countdown:");
 }
 
 void loop() {
-  // Read input from Serial Monitor
-  if (Serial.available() > 0 && !countingDown) {
-    String input = Serial.readStringUntil('\n');
-    countdownFrom = input.toInt();
-    if (countdownFrom >= 0 && countdownFrom <= 999) {
-      countingDown = true;
-      currentNumber = countdownFrom;
-      lastPlayTime = millis() - 1500; // allow immediate start
-      Serial.print("Starting countdown from ");
-      Serial.println(countdownFrom);
+  static bool running   = false;
+  static unsigned long doneAt = 0;
+
+  // — New countdown?
+  if (!running && Serial.available()) {
+    int input = Serial.readStringUntil('\n').toInt();
+    if (input >= 0 && input <= 999) {
+      Serial.printf("▶️ Starting countdown from %d\n", input);
+      startFullCountdown(input);
+      // Estimate ~1.8s per number, so we know when to stop.
+      doneAt = millis() + (unsigned long)(input + 1) * 1800;
+      running = true;
     } else {
-      Serial.println("Invalid number. Enter a value from 0–999.");
+      Serial.println("Invalid—enter a number from 0 to 999.");
     }
   }
 
-  // Perform countdown
-  if (countingDown && millis() - lastPlayTime >= 2000) { // ~1.5s per count
-    playNumber(currentNumber);
-    lastPlayTime = millis();
-    currentNumber--;
+  // — Detect finish
+  if (running && audio && millis() >= doneAt) {
+    audio->stop();
+    delete audio;    audio    = nullptr;
+    delete playlist; playlist = nullptr;
 
-    if (currentNumber < 0) {
-      countingDown = false;
-      Serial.println("Countdown complete. Enter a new number:");
-    }
+    Serial.println("✅ Countdown complete. Enter new number:");
+    running = false;
+    doneAt   = 0;
   }
 }
